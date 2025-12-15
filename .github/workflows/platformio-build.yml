@@ -45,7 +45,7 @@ jobs:
       id: extract-version
       run: |
         # Parse JSON response to get the latest version
-        VERSION=$(echo '${{ steps.get-version.outputs.response }}' | jq -r .info.version)
+        VERSION=$(echo "${{ steps.get-version.outputs.response }}" | jq -r .info.version)
         
         # Validate version format (semver)
         if [[ ! $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
