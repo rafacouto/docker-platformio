@@ -1,5 +1,13 @@
 name: PlatformIO Multi-Platform Docker Builder
 
+# Ensure workflow can push commits and avoid overlapping runs
+permissions:
+  contents: write
+
+concurrency:
+  group: platformio-docker-builder
+  cancel-in-progress: true
+
 on:
   schedule:
     - cron: '0 8 * * *'  # Daily at 8 AM UTC
@@ -8,63 +16,64 @@ on:
 jobs:
   get-version:
     runs-on: ubuntu-22.04
-    
+
     outputs:
       platformio_version: ${{ steps.get-version.outputs.version }}
       build_required: ${{ steps.check-version.outputs.build_required }}
-    
+
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
-      
+
     - name: Get latest PlatformIO version
       id: get-version
       run: |
-        VERSION=$(curl -s https://pypi.org/pypi/platformio/json | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4)
+        # Use python to parse PyPI JSON reliably (avoids brittle grep)
+        VERSION=$(curl -s https://pypi.org/pypi/platformio/json | python3 -c "import sys, json; print(json.load(sys.stdin)['info']['version'])")
         echo "version=$VERSION" >> $GITHUB_OUTPUT
         echo "Latest PlatformIO version: $VERSION"
-        
+
     - name: Check if version changed
       id: check-version
       run: |
         if [ -f "version.txt" ]; then
           CURRENT=$(cat version.txt)
           LATEST="${{ steps.get-version.outputs.version }}"
-          
+
           if [ "$CURRENT" = "$LATEST" ]; then
             echo "Version unchanged: $CURRENT"
             echo "build_required=false" >> $GITHUB_OUTPUT
             exit 0
           fi
         fi
-        
+
         echo "New version detected or first run"
         echo "build_required=true" >> $GITHUB_OUTPUT
 
   build-base-image:
     needs: get-version
     if: needs.get-version.outputs.build_required == 'true'
-    
+
     runs-on: ubuntu-latest
-    
+
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
-      
+
     - name: Update version file
       run: |
         echo "${{ needs.get-version.outputs.platformio_version }}" > version.txt
         echo "Updated version.txt to: ${{ needs.get-version.outputs.platformio_version }}"
-        
+
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
-      
+
     - name: Login to Docker Hub
       uses: docker/login-action@v2
       with:
         username: ${{ secrets.DOCKER_USERNAME }}
         password: ${{ secrets.DOCKER_PASSWORD }}
-        
+
     - name: Build and push base image
       uses: docker/build-push-action@v4
       with:
@@ -72,7 +81,7 @@ jobs:
         push: true
         tags: |
           ${{ secrets.DOCKER_USERNAME }}/platformio:latest
-          ${{ secrets.DOCKIO_USERNAME }}/platformio:${{ needs.get-version.outputs.platformio_version }}
+          ${{ secrets.DOCKER_USERNAME }}/platformio:${{ needs.get-version.outputs.platformio_version }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
         build-args: |
@@ -81,10 +90,10 @@ jobs:
   build-platform-images:
     needs: [get-version, build-base-image]
     if: needs.get-version.outputs.build_required == 'true'
-    
+
     runs-on: ubuntu-latest
-    
-    # Matriz de plataformas populares
+
+    # Matrix of popular platforms
     strategy:
       matrix:
         platform:
@@ -113,20 +122,19 @@ jobs:
           - name: "riscv"
             description: "RISC-V"
 
-    
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
-      
+
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
-      
+
     - name: Login to Docker Hub
       uses: docker/login-action@v2
       with:
         username: ${{ secrets.DOCKER_USERNAME }}
         password: ${{ secrets.DOCKER_PASSWORD }}
-        
+
     - name: Build and push platform-specific image
       uses: docker/build-push-action@v4
       with:
@@ -144,7 +152,7 @@ jobs:
           org.label-schema.description="PlatformIO with ${{ matrix.platform.description }} platform"
           org.label-schema.version=${{ needs.get-version.outputs.platformio_version }}
           org.label-schema.platform=${{ matrix.platform.name }}
-          
+
     - name: Verify platform installation
       run: |
         echo "Built image with platform: ${{ matrix.platform.name }}"
@@ -155,125 +163,163 @@ jobs:
   build-all-platforms-image:
     needs: [get-version, build-base-image]
     if: needs.get-version.outputs.build_required == 'true'
-    
+
     runs-on: ubuntu-latest
-    
+
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
-      
+
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
-      
+
     - name: Login to Docker Hub
       uses: docker/login-action@v2
       with:
         username: ${{ secrets.DOCKER_USERNAME }}
         password: ${{ secrets.DOCKER_PASSWORD }}
 
+    - name: Build and push complete (all platforms) image
+      uses: docker/build-push-action@v4
+      with:
+        context: .
+        push: true
+        tags: |
+          ${{ secrets.DOCKER_USERNAME }}/platformio:${{ needs.get-version.outputs.platformio_version }}-complete
+          ${{ secrets.DOCKER_USERNAME }}/platformio:complete-latest
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        build-args: |
+          PLATFORMIO_VERSION=${{ needs.get-version.outputs.platformio_version }}
+          INSTALL_ALL_PLATFORMS=true
+      # If your Dockerfile uses INSTALL_ALL_PLATFORMS arg, it should trigger installing all desired platforms.
+    - name: Verify complete image
+      run: |
+        echo "Built complete image tags:"
+        echo "- ${{ secrets.DOCKER_USERNAME }}/platformio:${{ needs.get-version.outputs.platformio_version }}-complete"
+        echo "- ${{ secrets.DOCKER_USERNAME }}/platformio:complete-latest"
+
   update-repository:
     needs: [get-version, build-base-image, build-platform-images, build-all-platforms-image]
     if: always() && needs.get-version.outputs.build_required == 'true'
-    
+
     runs-on: ubuntu-22.04
-    
+
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
-      
+      with:
+        # ensure we fetch the branch so pushes work
+        fetch-depth: 0
+
     - name: Update version file
       run: |
         echo "${{ needs.get-version.outputs.platformio_version }}" > version.txt
-        
-    - name: Commit and push changes
+
+    - name: Commit and push changes (version.txt)
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action"
         git add version.txt
-        git commit -m "chore: update to PlatformIO v${{ needs.get-version.outputs.platformio_version }}"
-        git push
+        # Only commit if there are staged changes
+        if git diff --staged --quiet; then
+          echo "No changes to commit for version.txt"
+        else
+          git commit -m "chore: update to PlatformIO v${{ needs.get-version.outputs.platformio_version }}"
+          git push
+        fi
 
   generate-readme:
     needs: [get-version, build-base-image, build-platform-images]
     if: always() && needs.get-version.outputs.build_required == 'true'
-    
+
     runs-on: ubuntu-22.04
-    
+
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
-      
+      with:
+        fetch-depth: 0
+
     - name: Generate README.md
       run: |
-        cat > README.md << 'EOF'
-        # PlatformIO Docker Images
-        
-        ## 🚀 Latest Version: ${{ needs.get-version.outputs.platformio_version }}
-        
-        ## 📦 Available Images
-        
-        ### Base Image
-        - `${{ secrets.DOCKER_USERNAME }}/platformio:${{ needs.get-version.outputs.platformio_version }}` - PlatformIO Core only
-        - `${{ secrets.DOCKER_USERNAME }}/platformio:latest` - Latest version
-        
-        ### Platform-Specific Images
-        
-        | Platform | Tag | Description |
-        |----------|-----|-------------|
-        | **All Platforms** | `${{ secrets.DOCKER_USERNAME }}/platformio:${{ needs.get-version.outputs.platformio_version }}-complete` | All popular platforms pre-installed |
-        | **ESP32** | `${{ secrets.DOCKER_USERNAME }}/platformio:${{ needs.get-version.outputs.platformio_version }}-espressif32` | Espressif ESP32 |
-        | **ESP8266** | `${{ secrets.DOCKER_USERNAME }}/platformio:${{ needs.get-version.outputs.platformio_version }}-espressif8266` | Espressif ESP8266 |
-        | **AVR (Arduino)** | `${{ secrets.DOCKER_USERNAME }}/platformio:${{ needs.get-version.outputs.platformio_version }}-atmelavr` | Atmel AVR (Arduino) |
-        | **STM32** | `${{ secrets.DOCKER_USERNAME }}/platformio:${{ needs.get-version.outputs.platformio_version }}-ststm32` | ST STM32 |
-        | **Teensy** | `${{ secrets.DOCKER_USERNAME }}/platformio:${{ needs.get-version.outputs.platformio_version }}-teensy` | Teensy |
-        | **Raspberry Pi Pico** | `${{ secrets.DOCKER_USERNAME }}/platformio:${{ needs.get-version.outputs.platformio_version }}-raspberrypi` | Raspberry Pi Pico |
-        | **nRF52** | `${{ secrets.DOCKER_USERNAME }}/platformio:${{ needs.get-version.outputs.platformio_version }}-nordicnrf52` | Nordic nRF52 |
-        
-        ## 🐳 Usage Examples
-        
-        ### Basic Usage
-        ```bash
-        # Run PlatformIO commands
-        docker run --rm -v $(pwd):/workspace ${{ secrets.DOCKER_USERNAME }}/platformio:${{ needs.get-version.outputs.platformio_version }} pio --help
-        
-        # Initialize a new project
-        docker run --rm -v $(pwd):/workspace ${{ secrets.DOCKER_USERNAME }}/platformio:${{ needs.get-version.outputs.platformio_version }} pio project init --board esp32dev
-        ```
-        
-        ### Platform-Specific Usage
-        ```bash
-        # ESP32 project
-        docker run --rm -v $(pwd):/workspace ${{ secrets.DOCKER_USERNAME }}/platformio:${{ needs.get-version.outputs.platformio_version }}-espressif32 pio run
-        ```
-        
-        ### Docker Compose Example
-        ```yaml
-        version: '3'
-        services:
-          platformio:
-            image: ${{ secrets.DOCKER_USERNAME }}/platformio:${{ needs.get-version.outputs.platformio_version }}-espressif32
-            volumes:
-              - .:/workspace
-            working_dir: /workspace
-        ```
-        
-        ## 🔄 Automatic Updates
-        
-        This repository automatically builds new Docker images when a new version of PlatformIO is released.
-        
-        ## 📊 Build Status
-        
-        ![GitHub Actions](https://github.com/rafacouto/docker-platformio/workflows/PlatformIO%20Multi-Platform%20Docker%20Builder/badge.svg)
-        
-        ## 📝 License
-        
-        AGPL-3.0
-        EOF
-        
+        cat > README.md <<EOF
+# PlatformIO Docker Images
+
+## 🚀 Latest Version: ${{ needs.get-version.outputs.platformio_version }}
+
+## 📦 Available Images
+
+### Base Image
+- \`${{ secrets.DOCKER_USERNAME }}/platformio:${{ needs.get-version.outputs.platformio_version }}\` - PlatformIO Core only
+- \`${{ secrets.DOCKER_USERNAME }}/platformio:latest\` - Latest version
+
+### Platform-Specific Images
+
+| Platform | Tag | Description |
+|----------|-----|-------------|
+| **All Platforms** | \`${{ secrets.DOCKER_USERNAME }}/platformio:${{ needs.get-version.outputs.platformio_version }}-complete\` | All popular platforms pre-installed |
+| **ESP32** | \`${{ secrets.DOCKER_USERNAME }}/platformio:${{ needs.get-version.outputs.platformio_version }}-espressif32\` | Espressif ESP32 |
+| **ESP8266** | \`${{ secrets.DOCKER_USERNAME }}/platformio:${{ needs.get-version.outputs.platformio_version }}-espressif8266\` | Espressif ESP8266 |
+| **AVR (Arduino)** | \`${{ secrets.DOCKER_USERNAME }}/platformio:${{ needs.get-version.outputs.platformio_version }}-atmelavr\` | Atmel AVR (Arduino) |
+| **STM32** | \`${{ secrets.DOCKER_USERNAME }}/platformio:${{ needs.get-version.outputs.platformio_version }}-ststm32\` | ST STM32 |
+| **Teensy** | \`${{ secrets.DOCKER_USERNAME }}/platformio:${{ needs.get-version.outputs.platformio_version }}-teensy\` | Teensy |
+| **Raspberry Pi Pico** | \`${{ secrets.DOCKER_USERNAME }}/platformio:${{ needs.get-version.outputs.platformio_version }}-raspberrypi\` | Raspberry Pi Pico |
+| **nRF52** | \`${{ secrets.DOCKER_USERNAME }}/platformio:${{ needs.get-version.outputs.platformio_version }}-nordicnrf52\` | Nordic nRF52 |
+
+## 🐳 Usage Examples
+
+### Basic Usage
+\`\`\`bash
+# Run PlatformIO commands
+docker run --rm -v $(pwd):/workspace ${{ secrets.DOCKER_USERNAME }}/platformio:${{ needs.get-version.outputs.platformio_version }} pio --help
+
+# Initialize a new project
+docker run --rm -v $(pwd):/workspace ${{ secrets.DOCKER_USERNAME }}/platformio:${{ needs.get-version.outputs.platformio_version }} pio project init --board esp32dev
+\`\`\`
+
+### Platform-Specific Usage
+\`\`\`bash
+# ESP32 project
+docker run --rm -v $(pwd):/workspace ${{ secrets.DOCKER_USERNAME }}/platformio:${{ needs.get-version.outputs.platformio_version }}-espressif32 pio run
+\`\`\`
+
+### Docker Compose Example
+\`\`\`yaml
+version: '3'
+services:
+  platformio:
+    image: ${{ secrets.DOCKER_USERNAME }}/platformio:${{ needs.get-version.outputs.platformio_version }}-espressif32
+    volumes:
+      - .:/workspace
+    working_dir: /workspace
+\`\`\`
+
+## 🔄 Automatic Updates
+
+This repository automatically builds new Docker images when a new version of PlatformIO is released.
+
+## 📊 Build Status
+
+![GitHub Actions](https://github.com/rafacouto/docker-platformio/workflows/PlatformIO%20Multi-Platform%20Docker%20Builder/badge.svg)
+
+## 📝 License
+
+AGPL-3.0
+EOF
+
     - name: Commit generated README
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action"
         git add README.md
-        git commit -m "docs: update README for v${{ needs.get-version.outputs.platformio_version }}"
-        git push
+        if git diff --staged --quiet; then
+          echo "No README changes to commit"
+        else
+          git commit -m "docs: update README for v${{ needs.get-version.outputs.platformio_version }}"
+          git push
+        fi
