@@ -74,7 +74,7 @@ jobs:
         context: .
         push: true
         tags: |
-          ${{ secrets.DOCKER_USERNAME }}/platformio:latest
-          ${{ secrets.DOCKER_USERNAME }}/platformio:${{ needs.check-version.outputs.new_version }}
+          caligari/platformio:latest
+          caligari/platformio:${{ needs.check-version.outputs.new_version }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
