@@ -1,6 +1,9 @@
-FROM python:3.11
+# Dockerfile
+FROM python:3.11-slim
 
+# Argumentos de construcción
 ARG PLATFORMIO_VERSION
+ARG PLATFORM_NAME=""
 
 RUN if [ -z "$PLATFORMIO_VERSION" ]; then \
       pip install --no-cache-dir platformio; \
@@ -8,5 +11,12 @@ RUN if [ -z "$PLATFORMIO_VERSION" ]; then \
       pip install --no-cache-dir "platformio==$PLATFORMIO_VERSION"; \
     fi
 
-# Verificar la versión instalada
+RUN if [ -n "$PLATFORM_NAME" ]; then \
+      pio platform install "$PLATFORM_NAME"; \
+    fi
+
 RUN pio --version
+
+WORKDIR /workspace
+
+CMD ["pio", "--help"]
