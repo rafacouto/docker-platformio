@@ -1,185 +1,80 @@
-name: Optimized PlatformIO Docker Builder
+name: Build Docker on PlatformIO Update
 
 on:
   schedule:
-    # Run daily at 2:30 AM UTC - less load on GitHub servers
-    - cron: '30 2 * * *'
-  
-  # Allow manual trigger from GitHub UI
+    - cron: '0 8 * * *'
   workflow_dispatch:
-    
-  # Trigger on push to main to test changes
-  push:
-    branches: [ main ]
 
 jobs:
-  version-check:
-    # Use specific Ubuntu version for faster startup
-    # ubuntu-22.04 starts 30-50% faster than ubuntu-latest
+  check-version:
     runs-on: ubuntu-22.04
     
     outputs:
-      # These outputs will be available to other jobs
-      build_required: ${{ steps.decide.outputs.build_required }}
-      platformio_version: ${{ steps.extract-version.outputs.version }}
+      should_build: ${{ steps.compare.outputs.should_build }}
+      new_version: ${{ steps.get-version.outputs.latest_version }}
     
     steps:
-    - name: Checkout repository (sparse)
-      id: checkout
+    - name: Checkout
       uses: actions/checkout@v4
+      
+    - name: Setup Python (mínimo)
+      uses: actions/setup-python@v4
       with:
-        # Only checkout version.txt file to save time
-        sparse-checkout: |
-          version.txt
-        sparse-checkout-cone-mode: false
+        python-version: '3.11'
         
-    - name: Get latest PlatformIO version from PyPI API
+    - name: Get latest version
       id: get-version
-      # Using HTTP request instead of pip to avoid Python setup
-      uses: fjogeleit/http-request-action@v1
-      with:
-        url: 'https://pypi.org/pypi/platformio/json'
-        method: 'GET'
-        
-    - name: Extract version from JSON response
-      id: extract-version
       run: |
-        # Parse JSON response to get the latest version
-        VERSION=$(echo "${{ steps.get-version.outputs.response }}" | jq -r .info.version)
+        python -m pip install --upgrade pip --quiet
+        LATEST=$(pip index versions platformio 2>/dev/null | grep -E "^[[:space:]]*[0-9]+\.[0-9]+\.[0-9]+" | head -1 | tr -d '[:space:]')
+        echo "latest_version=$LATEST" >> $GITHUB_OUTPUT
+        echo "Latest: $LATEST"
         
-        # Validate version format (semver)
-        if [[ ! $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-          echo "Error: Invalid version format: $VERSION"
-          exit 1
-        fi
-        
-        echo "version=$VERSION" >> $GITHUB_OUTPUT
-        echo "Latest PlatformIO version: $VERSION"
-        
-    - name: Read current version from file
-      id: read-current
+    - name: Get current version
+      id: current-version
       run: |
-        # Check if version.txt exists
         if [ -f "version.txt" ]; then
-          CURRENT_VERSION=$(cat version.txt)
-          echo "Current version in repo: $CURRENT_VERSION"
-          echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+          CURRENT=$(cat version.txt)
+          echo "current_version=$CURRENT" >> $GITHUB_OUTPUT
         else
-          echo "No version.txt found - first run"
           echo "current_version=" >> $GITHUB_OUTPUT
         fi
         
-    - name: Decide if Docker build is needed
-      id: decide
+    - name: Compare versions
+      id: compare
       run: |
-        CURRENT="${{ steps.read-current.outputs.current_version }}"
-        LATEST="${{ steps.extract-version.outputs.version }}"
-        
-        # Compare versions - only build if different
-        if [ "$CURRENT" = "$LATEST" ]; then
-          echo "✅ Version unchanged: $CURRENT"
-          echo "build_required=false" >> $GITHUB_OUTPUT
+        if [ "${{ steps.current-version.outputs.current_version }}" = "${{ steps.get-version.outputs.latest_version }}" ]; then
+          echo "should_build=false" >> $GITHUB_OUTPUT
         else
-          echo "🚀 New version available: $CURRENT → $LATEST"
-          echo "build_required=true" >> $GITHUB_OUTPUT
+          echo "should_build=true" >> $GITHUB_OUTPUT
         fi
 
-  # This job only runs if version-check determines we need a new build
-  docker-build:
-    # Needs to complete after version-check job
-    needs: version-check
+  build-docker:
+    needs: check-version
+    if: needs.check-version.outputs.should_build == 'true'
     
-    # Only run if build is required
-    if: needs.version-check.outputs.build_required == 'true'
-    
-    # Use ubuntu-latest here because we need Docker pre-installed
     runs-on: ubuntu-latest
     
     steps:
-    - name: Checkout full repository
+    - name: Checkout
       uses: actions/checkout@v4
       
-    - name: Update version.txt with new version
-      run: |
-        # Update the version file with the latest version
-        echo "${{ needs.version-check.outputs.platformio_version }}" > version.txt
-        echo "Updated version.txt to: ${{ needs.version-check.outputs.platformio_version }}"
-        
     - name: Set up Docker Buildx
-      # Uses GitHub's built-in cache for faster builds
       uses: docker/setup-buildx-action@v3
-      with:
-        driver-opts: |
-          image=moby/buildkit:latest
-        
-    - name: Login to Docker Hub
+      
+    - name: Login to DockerHub
       uses: docker/login-action@v2
       with:
         username: ${{ secrets.DOCKER_USERNAME }}
         password: ${{ secrets.DOCKER_PASSWORD }}
         
-    - name: Build and push Docker image
+    - name: Build and push
       uses: docker/build-push-action@v4
       with:
         context: .
         push: true
         tags: |
-          # Tag with both version and latest
-          ${{ secrets.DOCKER_USERNAME }}/platformio:${{ needs.version-check.outputs.platformio_version }}
           ${{ secrets.DOCKER_USERNAME }}/platformio:latest
-          
-        # Use GitHub Actions cache for Docker layers
+          ${{ secrets.DOCKER_USERNAME }}/platformio:${{ needs.check-version.outputs.new_version }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
-        
-        # Build arguments for Dockerfile
-        build-args: |
-          PLATFORMIO_VERSION=${{ needs.version-check.outputs.platformio_version }}
-          
-    - name: Commit version update to repository
-      run: |
-        # Configure git
-        git config --local user.email "action@github.com"
-        git config --local user.name "GitHub Action"
-        
-        # Commit the version change
-        git add version.txt
-        git commit -m "chore: update platformio to v${{ needs.version-check.outputs.platformio_version }}"
-        
-        # Push the commit back to the repository
-        git push
-        
-    - name: Create GitHub Release
-      # Optional: Create a release tag for each version
-      uses: softprops/action-gh-release@v1
-      with:
-        tag_name: "v${{ needs.version-check.outputs.platformio_version }}"
-        name: "PlatformIO v${{ needs.version-check.outputs.platformio_version }}"
-        body: |
-          Automated release with PlatformIO version ${{ needs.version-check.outputs.platformio_version }}
-          
-          Changes:
-          - Updated PlatformIO to ${{ needs.version-check.outputs.platformio_version }}
-          
-          Docker image available at:
-          `${{ secrets.DOCKER_USERNAME }}/platformio:${{ needs.version-check.outputs.platformio_version }}`
-        draft: false
-        prerelease: false
-        generate_release_notes: true
-
-  # Optional: Notification job
-  notify:
-    needs: [version-check, docker-build]
-    runs-on: ubuntu-22.04
-    
-    # Only run if docker-build was triggered
-    if: always() && needs.version-check.outputs.build_required == 'true'
-    
-    steps:
-    - name: Send notification
-      run: |
-        if [ "${{ job.status }}" = "success" ]; then
-          echo "✅ Successfully built PlatformIO v${{ needs.version-check.outputs.platformio_version }}"
-        else
-          echo "❌ Build failed for PlatformIO v${{ needs.version-check.outputs.platformio_version }}"
-        fi
