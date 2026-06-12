@@ -6,6 +6,7 @@ on:
   workflow_dispatch:
 
 jobs:
+
   check-and-build:
     runs-on: ubuntu-latest
     
@@ -69,3 +70,14 @@ jobs:
         tags: |
           ${{ secrets.DOCKER_USERNAME }}/platformio:latest
           ${{ secrets.DOCKER_USERNAME }}/platformio:${{ steps.get-version.outputs.version }}
+
+  keepalive:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: liskin/gh-workflow-keepalive@v1
+        with:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
